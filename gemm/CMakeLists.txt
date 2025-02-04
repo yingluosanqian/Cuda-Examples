@@ -4,9 +4,14 @@ cmake_minimum_required(VERSION 3.21)
 project(gemm LANGUAGES CXX CUDA)
 enable_language(CUDA)
 
-set(CMAKE_CUDA_ARCHITECTURES 86)
+# GPU ARCH
+set(CMAKE_CUDA_ARCHITECTURES 80)
+if (DEFINED ARCH)
+    set(CMAKE_CUDA_ARCHITECTURES ${ARCH})
+endif()
 
 add_executable(sgemm_A10 sgemm_A10.cu)
-target_compile_options(sgemm_A10 PRIVATE "--expt-relaxed-constexpr" "-arch=sm_86")
+target_compile_options(sgemm_A10 PRIVATE "--expt-relaxed-constexpr")
 
-include_directories(/mnt/workspace/cutlass/build_sm86/install/include)
+# Cutlass Path
+include_directories($ENV{CUTLASS_PATH})
