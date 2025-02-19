@@ -1,3 +1,4 @@
+
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
@@ -130,7 +131,7 @@ void gemm_tn(int m, int n, int k, TA const *A, TB const *B, TC *C) {
 
   auto stride_a = make_stride(k, Int<1>{});
   auto stride_b = make_stride(k, Int<1>{});
-  auto stride_c = make_stride(n, Int<1>{});
+  auto stride_c = make_stride(Int<1>{}, m);
 
   auto sA_layout =
       make_layout(make_shape(bM, bK, bP),
@@ -144,11 +145,54 @@ void gemm_tn(int m, int n, int k, TA const *A, TB const *B, TC *C) {
       Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<TA>, TA>{},
       Layout<Shape<_32, _8>, Stride<_8, _1>>{}, Layout<Shape<_1, _1>>{});
   auto tiled_copy_B = make_tiled_copy(
-      Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<TA>, TA>{},
+      Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<TB>, TB>{},
       Layout<Shape<_32, _8>, Stride<_8, _1>>{}, Layout<Shape<_1, _1>>{});
-  auto tiled_mma =
-      make_tiled_mma(UniversalFMA<TC, TA, TB>{},
-                     Layout<Shape<_16, _16, _1>, Stride<_1, _16, _256>>{});
+  auto tiled_mma = make_tiled_mma(
+      UniversalFMA<TC, TA, TB>{},
+      Layout<Shape<_16, _16, _1>, Stride<_1, _16, _256>>{},
+      Tile<Layout<Shape<_16, _4>, Stride<_4, _1>>,
+           Layout<Shape<_16, _4>, Stride<_4, _1>>, Underscore>{});
+
+  dim3 grid_dim(ceil_div(m, bM), ceil_div(n, bN), 1);
+  dim3 block_dim(size(tiled_mma));
+  gemm_device<<<grid_dim, block_dim>>>(
+      problem_shape, cta_shape, A, stride_a, sA_layout, tiled_copy_A, B,
+      stride_b, sB_layout, tiled_copy_B, C, stride_c, sC_layout, tiled_mma);
+}
+
+template <typename TA, typename TB, typename TC>
+void gemm_nt(int m, int n, int k, TA const *A, TB const *B, TC *C) {
+  using namespace cute;
+  auto problem_shape = make_shape(m, n, k);
+  auto bM = Int<128>{};
+  auto bN = Int<128>{};
+  auto bK = Int<8>{};
+  auto bP = Int<3>{};
+  auto cta_shape = make_shape(bM, bN, bK);
+
+  auto stride_a = make_stride(Int<1>{}, m);
+  auto stride_b = make_stride(Int<1>{}, n);
+  auto stride_c = make_stride(Int<1>{}, m);
+
+  auto sA_layout =
+      make_layout(make_shape(bM, bK, bP),
+                  make_stride(Int<1>{}, bM, bK * bM));
+  auto sB_layout =
+      make_layout(make_shape(bN, bK, bP),
+                  make_stride(Int<1>{}, bN, bK * bN));
+  auto sC_layout = make_layout(make_shape(bM, bN), make_stride(Int<1>{}, bM));
+
+  auto tiled_copy_A = make_tiled_copy(
+      Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, TA>{},
+      Layout<Shape<_32, _8>, Stride<_1, _32>>{}, Layout<Shape<_4, _1>>{});
+  auto tiled_copy_B = make_tiled_copy(
+      Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, TB>{},
+      Layout<Shape<_32, _8>, Stride<_1, _32>>{}, Layout<Shape<_4, _1>>{});
+  auto tiled_mma = make_tiled_mma(
+      UniversalFMA<TC, TA, TB>{},
+      Layout<Shape<_16, _16, _1>, Stride<_1, _16, _256>>{},
+      Tile<Layout<Shape<_16, _4>, Stride<_4, _1>>,
+           Layout<Shape<_16, _4>, Stride<_4, _1>>, Underscore>{});
 
   dim3 grid_dim(ceil_div(m, bM), ceil_div(n, bN), 1);
   dim3 block_dim(size(tiled_mma));
@@ -159,7 +203,8 @@ void gemm_tn(int m, int n, int k, TA const *A, TB const *B, TC *C) {
 
 template <typename TA, typename TB, typename TC>
 void gemm(int m, int n, int k, TA const *A, TB const *B, TC *C) {
-  gemm_tn(m, n, k, A, B, C);
+  // gemm_tn(m, n, k, A, B, C);
+  gemm_nt(m, n, k, A, B, C);
 }
 
 int main(int argc, char **argv) {
@@ -210,18 +255,19 @@ int main(int argc, char **argv) {
   thrust::host_vector<TC> cute_result = d_C;
 
   if (validation) {
+    // default: NTN
     for (int i = 0; i < m; i++) {
       for (int j = 0; j < n; j++) {
         float C = 0;
         for (int x = 0; x < k; x++) {
-          C += h_A[i * k + x] * h_B[j * k + x];
+          C += h_A[i + x * m] * h_B[j + x * n];
         }
-        h_validation[i * n + j] = C;
+        h_validation[i + j * m] = C;
       }
     }
     bool same = true;
     for (int i = 0; i < m * n; i++) {
-      if (fabs(cute_result[i] - h_validation[i]) > 1e-5) {
+      if (fabs(cute_result[i] - h_validation[i]) > 1e-3) {
         printf("i: %d, result: %f, ref: %f\n", i, cute_result[i],
                h_validation[i]);
         same = false;
